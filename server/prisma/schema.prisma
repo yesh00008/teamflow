@@ -1,0 +1,405 @@
+// TeamFlow data model
+// Five primary aggregates: Users, Projects, Tasks, RCAs, Notifications.
+// See docs/ERD.md for the diagram and modelling rationale.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum ProjectRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum TaskStatus {
+  BACKLOG
+  TODO
+  IN_PROGRESS
+  IN_REVIEW
+  DONE
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// Directional dependency between two tasks.
+// A BLOCKS relation means: source blocks target (target is blocked by source).
+enum RelationType {
+  BLOCKS
+  RELATES_TO
+}
+
+enum RcaStatus {
+  DRAFT
+  IN_REVIEW
+  APPROVED
+  REJECTED
+  CLOSED
+}
+
+enum RcaSeverity {
+  SEV1
+  SEV2
+  SEV3
+  SEV4
+}
+
+enum RcaSectionType {
+  TIMELINE
+  CONTRIBUTING_FACTORS
+  CORRECTIVE_ACTIONS
+  PREVENTIVE_MEASURES
+}
+
+enum ReviewDecision {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum NotificationType {
+  TASK_ASSIGNED
+  TASK_STATUS_CHANGED
+  TASK_COMMENT_MENTION
+  RCA_SUBMITTED
+  RCA_REVIEW_DECISION
+  RCA_CLOSED
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+}
+
+enum NotificationState {
+  PENDING
+  SENT
+  SUPPRESSED
+  FAILED
+}
+
+enum ViewMode {
+  KANBAN
+  CALENDAR
+  LIST
+}
+
+enum ThemePref {
+  LIGHT
+  DARK
+}
+
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  theme        ThemePref @default(LIGHT)
+  emailOptOut  Boolean  @default(false) // per-user email opt-out
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships      ProjectMember[]
+  assignedTasks    Task[]           @relation("TaskAssignee")
+  createdTasks     Task[]           @relation("TaskCreator")
+  comments         Comment[]
+  authoredRcas     RCA[]            @relation("RcaAuthor")
+  reviews          Review[]
+  notifications    Notification[]
+  activityLogs     ActivityLog[]
+  viewPreferences  ViewPreference[]
+  uploads          Attachment[]
+}
+
+// ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+
+model Project {
+  id          String   @id @default(cuid())
+  key         String   @unique // short human code, e.g. "TF"
+  name        String
+  description String?
+  archived    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  members         ProjectMember[]
+  tasks           Task[]
+  rcas            RCA[]
+  activityLogs    ActivityLog[]
+  viewPreferences ViewPreference[]
+}
+
+model ProjectMember {
+  id        String      @id @default(cuid())
+  project   Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  role      ProjectRole @default(MEMBER)
+  createdAt DateTime    @default(now())
+
+  @@unique([projectId, userId]) // a user has one role per project
+  @@index([userId])
+}
+
+// Per-user, per-project UI view preference (Kanban / calendar / list).
+model ViewPreference {
+  id        String   @id @default(cuid())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  viewMode  ViewMode @default(KANBAN)
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, projectId])
+}
+
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
+
+model Task {
+  id          String       @id @default(cuid())
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId   String
+  number      Int          // per-project sequential number (e.g. TF-14)
+  title       String
+  description String?
+  status      TaskStatus   @default(TODO)
+  priority    TaskPriority @default(MEDIUM)
+
+  assignee   User?   @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  assigneeId String?
+
+  creator   User   @relation("TaskCreator", fields: [creatorId], references: [id])
+  creatorId String
+
+  // Self-relation for sub-tasks (a task may have one parent and many children).
+  parent   Task?   @relation("TaskHierarchy", fields: [parentId], references: [id])
+  parentId String?
+  children Task[]  @relation("TaskHierarchy")
+
+  dueDate   DateTime?
+  startDate DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Dependency edges where this task is the source / the target.
+  outgoingRelations TaskRelation[] @relation("RelationSource")
+  incomingRelations TaskRelation[] @relation("RelationTarget")
+
+  comments    Comment[]
+  attachments Attachment[]
+
+  @@unique([projectId, number])
+  @@index([projectId, status])
+  @@index([assigneeId])
+}
+
+// A directional edge between two tasks. Dependencies can therefore be tracked
+// even when the two tasks live in different projects (cross-project support).
+model TaskRelation {
+  id        String       @id @default(cuid())
+  source    Task         @relation("RelationSource", fields: [sourceId], references: [id], onDelete: Cascade)
+  sourceId  String
+  target    Task         @relation("RelationTarget", fields: [targetId], references: [id], onDelete: Cascade)
+  targetId  String
+  type      RelationType @default(BLOCKS)
+  createdAt DateTime     @default(now())
+
+  @@unique([sourceId, targetId, type])
+  @@index([targetId])
+}
+
+// ---------------------------------------------------------------------------
+// Comments & Attachments (shared by Tasks and RCAs)
+// ---------------------------------------------------------------------------
+
+model Comment {
+  id        String   @id @default(cuid())
+  body      String
+  author    User     @relation(fields: [authorId], references: [id])
+  authorId  String
+
+  // A comment attaches to exactly one of task or rca.
+  task   Task?   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  taskId String?
+  rca    RCA?    @relation(fields: [rcaId], references: [id], onDelete: Cascade)
+  rcaId  String?
+
+  // Users @mentioned in this comment (drives notifications).
+  mentions CommentMention[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([taskId])
+  @@index([rcaId])
+}
+
+model CommentMention {
+  id            String  @id @default(cuid())
+  comment       Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  commentId     String
+  mentionedId   String  // referenced user id
+
+  @@unique([commentId, mentionedId])
+}
+
+model Attachment {
+  id          String   @id @default(cuid())
+  filename    String   // original filename
+  storageKey  String   // key/path in object storage
+  mimeType    String
+  sizeBytes   Int
+  uploadedBy  User     @relation(fields: [uploaderId], references: [id])
+  uploaderId  String
+
+  task   Task?   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  taskId String?
+  rca    RCA?    @relation(fields: [rcaId], references: [id], onDelete: Cascade)
+  rcaId  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([taskId])
+  @@index([rcaId])
+}
+
+// ---------------------------------------------------------------------------
+// Root Cause Analysis (RCA)
+// ---------------------------------------------------------------------------
+
+model RCA {
+  id          String      @id @default(cuid())
+  project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId   String
+  number      Int
+  title       String
+  summary     String?
+  severity    RcaSeverity @default(SEV3)
+  status      RcaStatus   @default(DRAFT)
+
+  author   User   @relation("RcaAuthor", fields: [authorId], references: [id])
+  authorId String
+
+  sections    RCASection[]
+  reviews     Review[]
+  comments    Comment[]
+  attachments Attachment[]
+
+  submittedAt DateTime?
+  closedAt    DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([projectId, number])
+  @@index([projectId, status])
+}
+
+model RCASection {
+  id      String         @id @default(cuid())
+  rca     RCA            @relation(fields: [rcaId], references: [id], onDelete: Cascade)
+  rcaId   String
+  type    RcaSectionType
+  content String         @default("")
+  order   Int            @default(0)
+
+  @@unique([rcaId, type])
+}
+
+// A reviewer's decision on an RCA. The mandatory comment is enforced in code
+// when decision transitions away from PENDING.
+model Review {
+  id         String         @id @default(cuid())
+  rca        RCA            @relation(fields: [rcaId], references: [id], onDelete: Cascade)
+  rcaId      String
+  reviewer   User           @relation(fields: [reviewerId], references: [id])
+  reviewerId String
+  decision   ReviewDecision @default(PENDING)
+  comment    String?
+  decidedAt  DateTime?
+  createdAt  DateTime       @default(now())
+
+  @@unique([rcaId, reviewerId]) // one review slot per reviewer per RCA
+  @@index([reviewerId])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+// Every alert is recorded here BEFORE dispatch (log-before-send), which is what
+// makes duplicate suppression and delivery tracking possible. The dedupeKey is
+// a deterministic hash of (recipient, type, subject, channel, time-bucket); a
+// unique index on it turns duplicate suppression into a database guarantee.
+model Notification {
+  id          String              @id @default(cuid())
+  recipient   User                @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  recipientId String
+  type        NotificationType
+  channel     NotificationChannel
+  state       NotificationState   @default(PENDING)
+
+  title   String
+  body    String
+  // Loose reference to the originating entity (task id, rca id, ...).
+  entityType String?
+  entityId   String?
+
+  dedupeKey String  @unique
+  readAt    DateTime?
+  sentAt    DateTime?
+  error     String?
+  createdAt DateTime @default(now())
+
+  @@index([recipientId, state])
+  @@index([recipientId, readAt])
+}
+
+// ---------------------------------------------------------------------------
+// Activity Log (append-only audit trail)
+// ---------------------------------------------------------------------------
+
+model ActivityLog {
+  id        String   @id @default(cuid())
+  actor     User?    @relation(fields: [actorId], references: [id])
+  actorId   String?
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String?
+
+  action     String // e.g. "task.status_changed"
+  entityType String // "task" | "rca" | "review" | ...
+  entityId   String
+  // Structured before/after or context payload.
+  metadata   Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([projectId, createdAt])
+  @@index([entityType, entityId])
+}

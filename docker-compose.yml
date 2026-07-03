@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: teamflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: teamflow
+      POSTGRES_PASSWORD: teamflow
+      POSTGRES_DB: teamflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - teamflow_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U teamflow -d teamflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # MailHog: captures all outbound email so you can view it in a web UI
+  # SMTP on 1025, web UI on http://localhost:8025
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: teamflow-mailhog
+    restart: unless-stopped
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+volumes:
+  teamflow_pgdata:
